@@ -1,17 +1,16 @@
-"""End-to-end PdM pipeline: simulate → baseline → analytics → twin update → outputs."""
+"""End-to-end PdM pipeline: simulate once, then process one reading at a time."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pandas as pd
 
-from analytics.anomaly import detect_anomalies
-from analytics.diagnosis import diagnose_faults
-from analytics.prognosis import latest_summary, track_degradation_and_risk
-from baseline import compute_baseline, save_baseline
+from analytics.online_engine import OnlinePdMEngine
+from analytics.prognosis import latest_summary
+from baseline import save_baseline
 from digital_twin import FanDigitalTwin
 from sensor_simulator import save_sensor_data, simulate
 
@@ -34,25 +33,40 @@ def update_twin_from_row(fan: FanDigitalTwin, row: Any) -> FanDigitalTwin:
     return fan
 
 
+def iter_online_results(
+    df: pd.DataFrame,
+    engine: OnlinePdMEngine | None = None,
+    fan: FanDigitalTwin | None = None,
+) -> Iterator[tuple[dict[str, Any], FanDigitalTwin, OnlinePdMEngine]]:
+    """Yield (enriched_row, twin, engine) for each source reading in order."""
+    engine = engine or OnlinePdMEngine()
+    fan = fan or FanDigitalTwin()
+    for _, row in df.iterrows():
+        enriched = engine.process(row)
+        update_twin_from_row(fan, enriched)
+        yield enriched, fan, engine
+
+
 def run_analytics(
     df: pd.DataFrame | None = None,
     fan: FanDigitalTwin | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], FanDigitalTwin]:
-    """Run simulation (if needed), analytics, and update the digital twin."""
+    """Simulate if needed, then online-process every row (warm-up then live PdM)."""
     if df is None:
         df = simulate()
     if fan is None:
         fan = FanDigitalTwin()
 
-    baseline = compute_baseline(df, max_day=7)
-    enriched = detect_anomalies(df, baseline)
-    enriched = diagnose_faults(enriched)
-    enriched = track_degradation_and_risk(enriched)
+    engine = OnlinePdMEngine()
+    rows: list[dict[str, Any]] = []
+    for enriched, fan, engine in iter_online_results(df, engine=engine, fan=fan):
+        rows.append(enriched)
 
-    update_twin_from_row(fan, enriched.iloc[-1])
-    summary = latest_summary(enriched)
+    enriched_df = pd.DataFrame(rows)
+    baseline = engine.baseline_frame()
+    summary = latest_summary(enriched_df)
     summary["twin"] = fan.to_dict()
-    return enriched, baseline, summary, fan
+    return enriched_df, baseline, summary, fan
 
 
 def daily_dashboard_series(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -120,6 +134,7 @@ def save_pipeline_outputs(
             "rul_days",
             "true_degradation",
             "fault_label",
+            "phase",
         ]
         if c in enriched.columns
     ]

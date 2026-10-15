@@ -1,7 +1,7 @@
-"""Live Streamlit PdM dashboard — in-memory day/hour streaming (no database).
+"""Live Streamlit PdM dashboard — simulate once, then online one-row analytics.
 
-Run from the backend/ directory:
-    streamlit run streamlit_app.py
+Warm-up Days 1–7 learn the baseline. From Day 8 each reading runs
+anomaly → diagnosis → prognosis → twin, then the UI updates.
 """
 
 from __future__ import annotations
@@ -12,13 +12,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from analytics.online_engine import OnlinePdMEngine
 from analytics.prognosis import latest_summary
-from baseline import compute_baseline
 from digital_twin import FanDigitalTwin
 from fault_simulator import MINUTES_PER_DAY
 from pipeline import (
     daily_dashboard_series,
-    run_analytics,
     save_pipeline_outputs,
     update_twin_from_row,
 )
@@ -32,47 +31,48 @@ st.set_page_config(page_title="AHU Fan PdM Live", page_icon="🔧", layout="wide
 
 st.title("AHU-FAN-001 — Live Predictive Maintenance")
 st.caption(
-    "Streams analytics in memory day-by-day (or hour-by-hour) "
-    "so charts and metrics grow like a live plant feed."
+    "Generate sensor data once, then process **one reading at a time**: "
+    "Days 1–7 warm-up baseline → Day 8+ anomaly → diagnosis → prognosis → twin → UI."
 )
 
 
-def _prepare_run(n_days: int, seed: int) -> pd.DataFrame:
-    """Simulate and run full analytics once so playback has correct scores."""
-    df = simulate(n_minutes=n_days * MINUTES_PER_DAY, seed=seed)
-    enriched, _, _, _ = run_analytics(df=df)
-    return enriched
-
-
-def _chunk_frames(enriched: pd.DataFrame, mode: str):
-    """Yield (label, dataframe chunk) for live playback."""
+def _chunk_source(df: pd.DataFrame, mode: str):
+    """Yield (label, source chunk) for UI refresh cadence."""
     if mode == "Day":
-        for day, g in enriched.groupby("day"):
+        for day, g in df.groupby("day"):
             yield f"Day {int(day)}", g
         return
 
-    work = enriched.reset_index(drop=True).copy()
+    work = df.reset_index(drop=True).copy()
     work["_hour"] = work.index // 60
     for hour, g in work.groupby("_hour"):
         day = int(g["day"].iloc[-1])
-        yield f"Day {day} · hour {int(hour) % 24 + 1}", g.drop(columns=["_hour"])
+        phase = "warm-up" if day <= 7 else "live"
+        yield f"Day {day} · hour {int(hour) % 24 + 1} ({phase})", g.drop(columns=["_hour"])
 
 
 def _daily_so_far(seen: pd.DataFrame) -> pd.DataFrame:
-    """Build daily chart rows from the in-memory buffer streamed so far."""
+    """Build daily chart rows from enriched rows streamed so far."""
     return pd.DataFrame(daily_dashboard_series(seen))
 
 
 def _render_live_panel(
-    latest: pd.Series,
+    latest: pd.Series | dict,
     daily: pd.DataFrame,
     twin: dict,
     rows_seen: int,
     status_label: str,
 ) -> None:
-    """Draw current metrics/charts from the in-memory buffer."""
-    st.markdown(f"**Live clock:** `{latest.get('timestamp', '—')}` · {status_label}")
-    st.caption(f"In-memory readings streamed: **{rows_seen:,}**")
+    """Draw current metrics/charts from the in-memory enriched buffer."""
+    if isinstance(latest, dict):
+        latest = pd.Series(latest)
+
+    phase = str(latest.get("phase", ""))
+    phase_note = " · warm-up (learning baseline)" if phase == "warmup" else ""
+    st.markdown(
+        f"**Live clock:** `{latest.get('timestamp', '—')}` · {status_label}{phase_note}"
+    )
+    st.caption(f"Readings processed online: **{rows_seen:,}**")
 
     risk = str(latest.get("risk_level", "Low"))
     c1, c2, c3, c4 = st.columns(4)
@@ -193,7 +193,7 @@ with st.sidebar:
     st.header("Live run")
     n_days = st.slider("Days to simulate", 14, 30, 30, 1)
     seed = st.number_input("Random seed", 0, 10_000, DEFAULT_SEED)
-    step_mode = st.selectbox("Stream step", ["Day", "Hour"], index=0)
+    step_mode = st.selectbox("UI refresh step", ["Day", "Hour"], index=0)
     speed = st.select_slider(
         "Playback delay",
         options=["Fast", "Normal", "Slow"],
@@ -204,44 +204,54 @@ with st.sidebar:
     start = st.button("▶ Start live stream", type="primary", use_container_width=True)
     st.markdown("---")
     st.markdown(
-        "Each step appends to an **in-memory buffer**. "
-        "Charts grow over time; optional CSV/JSON export is separate."
+        "**Days 1–7:** learn healthy baseline only.  \n"
+        "**Day 8+:** each reading → anomaly → diagnosis → prognosis → twin → UI."
     )
 
 progress = st.progress(0.0, text="Idle")
 live_area = st.empty()
 
 if start:
-    with st.spinner("Preparing simulation + analytics…"):
-        enriched = _prepare_run(int(n_days), int(seed))
-        if save_files:
-            fan_full = FanDigitalTwin()
-            update_twin_from_row(fan_full, enriched.iloc[-1])
-            summary = latest_summary(enriched)
-            baseline = compute_baseline(enriched)
-            save_pipeline_outputs(enriched, baseline, summary, fan_full, DATA_DIR)
+    with st.spinner("Generating source sensor data (one go)…"):
+        source = simulate(n_minutes=int(n_days) * MINUTES_PER_DAY, seed=int(seed))
 
+    engine = OnlinePdMEngine()
     fan = FanDigitalTwin()
-    seen_parts: list[pd.DataFrame] = []
-    chunks = list(_chunk_frames(enriched, step_mode))
+    enriched_rows: list[dict] = []
+    chunks = list(_chunk_source(source, step_mode))
     total = len(chunks)
 
     for i, (label, chunk) in enumerate(chunks, start=1):
-        seen_parts.append(chunk)
-        seen = pd.concat(seen_parts, ignore_index=True)
-        last_row = chunk.iloc[-1]
-        update_twin_from_row(fan, last_row)
+        # Process every minute in this chunk online (one by one).
+        for _, row in chunk.iterrows():
+            enriched = engine.process(row)
+            update_twin_from_row(fan, enriched)
+            enriched_rows.append(enriched)
 
-        progress.progress(i / total, text=f"Streaming {label} ({i}/{total})")
+        seen = pd.DataFrame(enriched_rows)
+        latest = enriched_rows[-1]
+        day = int(latest["day"])
+        if day <= 7:
+            status = f"{label} · warm-up"
+        else:
+            status = f"{label} · live PdM"
+
+        progress.progress(i / total, text=f"Processing {status} ({i}/{total})")
         with live_area.container():
             _render_live_panel(
-                last_row,
+                latest,
                 _daily_so_far(seen),
                 fan.to_dict(),
-                len(seen),
-                label,
+                len(enriched_rows),
+                status,
             )
         time.sleep(delay)
+
+    enriched = pd.DataFrame(enriched_rows)
+    baseline = engine.baseline_frame()
+    summary = latest_summary(enriched)
+    if save_files:
+        save_pipeline_outputs(enriched, baseline, summary, fan, DATA_DIR)
 
     progress.progress(1.0, text="Live stream complete")
     daily_full = _daily_so_far(enriched)
@@ -260,7 +270,11 @@ if start:
             len(enriched),
             "Run complete — full history",
         )
-    st.success(f"Finished. Streamed {len(enriched):,} readings in memory.")
+    st.success(
+        f"Finished. Generated {len(source):,} source rows once; "
+        f"processed {len(enriched):,} readings online "
+        f"(warm-up days 1–7, live from day 8)."
+    )
 
 elif "last_result" in st.session_state:
     r = st.session_state["last_result"]
